@@ -1,4 +1,4 @@
-{-# LANGUAGE ForeignFunctionInterface #-}
+{-# LANGUAGE CApiFFI #-}
 
 module Lrzhs.Ffi where
 
@@ -9,7 +9,7 @@ import Foreign.C.String (CString)
 import Foreign.Ptr ()
 import Lrzhs.Types (Network (..))
 
-foreign import ccall "lrzhs_is_valid_shielded_address" rs_is_valid_sapling_address :: CString -> CUInt -> IO CBool
+foreign import capi "lrzhs_ffi.h lrzhs_is_valid_shielded_address" rs_is_valid_sapling_address :: CString -> CUInt -> IO CBool
 
 networkId :: Network -> CUInt
 networkId = \case

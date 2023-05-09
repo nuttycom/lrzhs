@@ -19,7 +19,7 @@ maintainer:         kris@nutty.land
 -- A copyright notice.
 -- copyright:
 -- category:
-extra-source-files: CHANGELOG.md
+extra-source-files: CHANGELOG.md, rust/target/Headers/lrzhs_ffi.h
 
 library
     build-depends:    
@@ -45,3 +45,5 @@ library
       Lrzhs.Ffi
     extra-libraries:
       lrzhs_ffi
+    include-dirs: rust/target/Headers
+    includes: rust/target/Headers/lrzhs_ffi.h
