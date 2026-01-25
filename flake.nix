@@ -2,7 +2,7 @@
   description = "A flake for building lrzhs, a set of Haskell bindings for librustzcash";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/release-24.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/release-24.11";
     flake-utils.url = "github:numtide/flake-utils";
     crane = {
       inputs.nixpkgs.follows = "nixpkgs";

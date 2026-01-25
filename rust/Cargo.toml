@@ -7,26 +7,17 @@ authors = [
     "Kris Nuttycombe <kris@nutty.land>",
 ]
 license = "MIT"
-edition = "2018"
+edition = "2021"
 build = "build.rs"
 
 [dependencies]
-failure = "0.1"
-ffi_helpers = "0.2"
-hex = "0.4"
-memuse = "0.2.1"
-schemer = "0.2.1"
-secp256k1 = "0.21"
-secrecy = "0.8"
-
-zcash_address = { version = "0.2" }
-zcash_client_backend = { version = "0.6.1", features = ["transparent-inputs", "unstable"] }
-zcash_client_sqlite = { version = "0.4.2", features = ["transparent-inputs", "unstable"] }
-zcash_primitives = "0.9.1"
-zcash_proofs = "0.9"
+anyhow = "1.0"
+ffi_helpers = "0.3"
+zcash_address = "0.10"
+zcash_protocol = "0.7"
 
 [build-dependencies]
-cbindgen = "0.14"
+cbindgen = "0.27"
 
 [lib]
 name = "lrzhs_ffi"
