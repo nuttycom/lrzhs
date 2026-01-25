@@ -2,7 +2,7 @@
   description = "A flake for building lrzhs, a set of Haskell bindings for librustzcash";
 
   inputs = {
-    nixpkgs.url = github:NixOS/nixpkgs/release-23.05;
+    nixpkgs.url = "github:NixOS/nixpkgs/release-24.05";
     flake-utils.url = "github:numtide/flake-utils";
     crane = {
       inputs.nixpkgs.follows = "nixpkgs";
@@ -20,12 +20,12 @@
     ## Define local packages, parameterized over the package set.
 
     lrzhs_ffi = pkgs: let
-      craneLib = crane.lib.${pkgs.system};
+      craneLib = crane.mkLib pkgs;
     in
       craneLib.buildPackage {
         src = craneLib.cleanCargoSource ./rust/.;
 
-        buildInputs = nixpkgs.lib.optionals pkgs.stdenv.isDarwin [
+        buildInputs = pkgs.lib.optionals pkgs.stdenv.isDarwin [
           pkgs.darwin.apple_sdk.frameworks.Security
           pkgs.libiconv
         ];
