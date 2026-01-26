@@ -1,12 +1,10 @@
 cabal-version:      2.4
 name:               lrzhs
 version:            0.1.0.0
-
--- A short (one-line) description of the package.
--- synopsis:
-
--- A longer description of the package.
--- description:
+synopsis:           Haskell light client library for Zcash
+description:        A Haskell FFI wrapper around zcash_client_backend and
+                    zcash_client_sqlite providing light client functionality
+                    for sending and receiving Zcash payments.
 
 -- A URL where users can report bugs.
 -- bug-reports:
@@ -24,6 +22,7 @@ extra-source-files: CHANGELOG.md
 library
     build-depends:
       base >= 4.15.1 && < 4.21,
+      bytestring >= 0.11 && < 0.13,
       text >= 1.2.5 && < 2.2,
     hs-source-dirs:   src
 
@@ -37,7 +36,7 @@ library
       RankNTypes,
       TupleSections,
       TypeApplications
-    
+
     exposed-modules:
       Lrzhs,
       Lrzhs.Types
