@@ -13,8 +13,23 @@ build = "build.rs"
 [dependencies]
 anyhow = "1.0"
 ffi_helpers = "0.3"
-zcash_address = "0.10"
+hex = "0.4"
+rand = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.1", features = ["v4"] }
+wagyu-zcash-parameters = "0.2"
+
+# Zcash dependencies - versions must match what zcash_client_backend uses
+zcash_client_backend = { version = "0.21", features = ["orchard"] }
+zcash_client_sqlite = { version = "0.19", features = ["orchard"] }
+zcash_keys = { version = "0.12", features = ["unstable", "orchard", "sapling"] }
+zcash_primitives = "0.26"
 zcash_protocol = "0.7"
+zcash_address = "0.10"
+zip32 = "0.2"
+secrecy = "0.8"
+rusqlite = "0.37"
 
 [build-dependencies]
 cbindgen = "0.27"
