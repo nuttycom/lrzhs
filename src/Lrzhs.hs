@@ -31,6 +31,12 @@ module Lrzhs
   , initDataDatabase
   , initBlockMetadataDb
 
+    -- * Wallet Handle Management
+  , WalletHandle
+  , openWallet
+  , closeWallet
+  , withWallet
+
     -- * Account Management
   , createAccount
   , importAccountUfvk
@@ -178,160 +184,181 @@ initBlockMetadataDb dbPath = do
         return $ Left $ maybe "Unknown error" id err
 
 -- ============================================================================
+-- Wallet Handle Management
+-- ============================================================================
+
+-- | Opaque handle to an open wallet database connection.
+-- Use 'openWallet' to create a handle and 'closeWallet' to release it,
+-- or use 'withWallet' for automatic resource management.
+newtype WalletHandle = WalletHandle (Ptr DbHandle)
+
+-- | Open a wallet database and return a handle.
+-- The handle should be closed with 'closeWallet' when no longer needed.
+openWallet :: FilePath -> Network -> IO (Either Text WalletHandle)
+openWallet dbPath network = do
+  let pathBS = TE.encodeUtf8 (pack dbPath)
+  BSU.unsafeUseAsCStringLen pathBS $ \(pathPtr, pathLen) -> do
+    handle <- rs_open_wallet (castPtr pathPtr) (fromIntegral pathLen) (networkId network)
+    if handle == nullPtr
+      then do
+        err <- getLastError
+        return $ Left $ maybe "Unknown error" id err
+      else return $ Right $ WalletHandle handle
+
+-- | Close a wallet handle and release its resources.
+closeWallet :: WalletHandle -> IO ()
+closeWallet (WalletHandle handle) = rs_close_wallet handle
+
+-- | Execute an action with a wallet handle, ensuring the handle is closed
+-- when the action completes (whether normally or via exception).
+withWallet :: FilePath -> Network -> (WalletHandle -> IO a) -> IO (Either Text a)
+withWallet dbPath network action = do
+  result <- openWallet dbPath network
+  case result of
+    Left err -> return $ Left err
+    Right handle ->
+      Right <$> bracket (pure handle) (\h -> closeWallet h) action
+
+-- ============================================================================
 -- Account Management
 -- ============================================================================
 
 -- | Create a new account from a seed.
 -- Returns the account ID and the unified spending key (USK).
 createAccount
-  :: FilePath
+  :: WalletHandle
   -> ByteString       -- ^ Seed
   -> TreeState        -- ^ Birthday tree state
   -> Maybe BlockHeight -- ^ Recover until height
-  -> Network
   -> Text             -- ^ Account name
   -> Maybe Text       -- ^ Key source
   -> IO (Either Text (AccountId, ByteString))
-createAccount dbPath seed treeState recoverUntil network name keySource = do
-  let pathBS = TE.encodeUtf8 (pack dbPath)
-  BSU.unsafeUseAsCStringLen pathBS $ \(pathPtr, pathLen) ->
-    BSU.unsafeUseAsCStringLen seed $ \(seedPtr, seedLen) ->
-      BSU.unsafeUseAsCStringLen (unBlockHash $ treeStateHash treeState) $ \(hashPtr, _) ->
-        withMaybeBS (treeStateSaplingTree treeState) $ \sapPtr sapLen ->
-          withMaybeBS (treeStateOrchardTree treeState) $ \orchPtr orchLen ->
-            withCString (unpack name) $ \namePtr ->
-              withMaybeCString keySource $ \keySourcePtr -> do
-                let recoverHeight = maybe (-1) (fromIntegral . unBlockHeight) recoverUntil
-                resultPtr <- rs_create_account
-                  (castPtr pathPtr) (fromIntegral pathLen)
-                  (castPtr seedPtr) (fromIntegral seedLen)
-                  (unBlockHeight $ treeStateHeight treeState)
-                  (castPtr hashPtr)
-                  (treeStateTime treeState)
-                  sapPtr sapLen
-                  orchPtr orchLen
-                  recoverHeight
-                  (networkId network)
-                  namePtr
-                  keySourcePtr
-                if resultPtr == nullPtr
-                  then do
-                    err <- getLastError
-                    return $ Left $ maybe "Unknown error" id err
-                  else do
-                    result <- peek resultPtr
-                    let uuid = AccountId $ ffiUuidBytes $ ffiCreateAccountUuid result
-                    uskLen <- return $ fromIntegral $ ffiCreateAccountUskLen result
-                    usk <- BS.packCStringLen (castPtr $ ffiCreateAccountUsk result, uskLen)
-                    rs_free_create_account_result resultPtr
-                    return $ Right (uuid, usk)
+createAccount (WalletHandle handle) seed treeState recoverUntil name keySource = do
+  BSU.unsafeUseAsCStringLen seed $ \(seedPtr, seedLen) ->
+    BSU.unsafeUseAsCStringLen (unBlockHash $ treeStateHash treeState) $ \(hashPtr, _) ->
+      withMaybeBS (treeStateSaplingTree treeState) $ \sapPtr sapLen ->
+        withMaybeBS (treeStateOrchardTree treeState) $ \orchPtr orchLen ->
+          withCString (unpack name) $ \namePtr ->
+            withMaybeCString keySource $ \keySourcePtr -> do
+              let recoverHeight = maybe (-1) (fromIntegral . unBlockHeight) recoverUntil
+              resultPtr <- rs_create_account
+                handle
+                (castPtr seedPtr) (fromIntegral seedLen)
+                (unBlockHeight $ treeStateHeight treeState)
+                (castPtr hashPtr)
+                (treeStateTime treeState)
+                sapPtr sapLen
+                orchPtr orchLen
+                recoverHeight
+                namePtr
+                keySourcePtr
+              if resultPtr == nullPtr
+                then do
+                  err <- getLastError
+                  return $ Left $ maybe "Unknown error" id err
+                else do
+                  result <- peek resultPtr
+                  let uuid = AccountId $ ffiUuidBytes $ ffiCreateAccountUuid result
+                  uskLen <- return $ fromIntegral $ ffiCreateAccountUskLen result
+                  usk <- BS.packCStringLen (castPtr $ ffiCreateAccountUsk result, uskLen)
+                  rs_free_create_account_result resultPtr
+                  return $ Right (uuid, usk)
 
 -- | Import an account from a UFVK (view-only account).
 importAccountUfvk
-  :: FilePath
+  :: WalletHandle
   -> Text             -- ^ UFVK encoded string
   -> TreeState        -- ^ Birthday tree state
   -> Maybe BlockHeight -- ^ Recover until height
-  -> Network
   -> AccountPurpose
   -> Text             -- ^ Account name
   -> Maybe Text       -- ^ Key source
   -> IO (Either Text AccountId)
-importAccountUfvk dbPath ufvk treeState recoverUntil network purpose name keySource = do
-  let pathBS = TE.encodeUtf8 (pack dbPath)
-  BSU.unsafeUseAsCStringLen pathBS $ \(pathPtr, pathLen) ->
-    withCString (unpack ufvk) $ \ufvkPtr ->
-      BSU.unsafeUseAsCStringLen (unBlockHash $ treeStateHash treeState) $ \(hashPtr, _) ->
-        withMaybeBS (treeStateSaplingTree treeState) $ \sapPtr sapLen ->
-          withMaybeBS (treeStateOrchardTree treeState) $ \orchPtr orchLen ->
-            withCString (unpack name) $ \namePtr ->
-              withMaybeCString keySource $ \keySourcePtr -> do
-                let recoverHeight = maybe (-1) (fromIntegral . unBlockHeight) recoverUntil
-                let spending = CBool $ case purpose of
-                      Spending -> 1
-                      ViewOnly -> 0
-                resultPtr <- rs_import_account_ufvk
-                  (castPtr pathPtr) (fromIntegral pathLen)
-                  ufvkPtr
-                  (unBlockHeight $ treeStateHeight treeState)
-                  (castPtr hashPtr)
-                  (treeStateTime treeState)
-                  sapPtr sapLen
-                  orchPtr orchLen
-                  recoverHeight
-                  (networkId network)
-                  spending
-                  namePtr
-                  keySourcePtr
-                  nullPtr
-                  0
-                if resultPtr == nullPtr
-                  then do
-                    err <- getLastError
-                    return $ Left $ maybe "Unknown error" id err
-                  else do
-                    result <- peek resultPtr
-                    let uuid = AccountId $ ffiUuidBytes result
-                    rs_free_uuid resultPtr
-                    return $ Right uuid
+importAccountUfvk (WalletHandle handle) ufvk treeState recoverUntil purpose name keySource = do
+  withCString (unpack ufvk) $ \ufvkPtr ->
+    BSU.unsafeUseAsCStringLen (unBlockHash $ treeStateHash treeState) $ \(hashPtr, _) ->
+      withMaybeBS (treeStateSaplingTree treeState) $ \sapPtr sapLen ->
+        withMaybeBS (treeStateOrchardTree treeState) $ \orchPtr orchLen ->
+          withCString (unpack name) $ \namePtr ->
+            withMaybeCString keySource $ \keySourcePtr -> do
+              let recoverHeight = maybe (-1) (fromIntegral . unBlockHeight) recoverUntil
+              let spending = CBool $ case purpose of
+                    Spending -> 1
+                    ViewOnly -> 0
+              resultPtr <- rs_import_account_ufvk
+                handle
+                ufvkPtr
+                (unBlockHeight $ treeStateHeight treeState)
+                (castPtr hashPtr)
+                (treeStateTime treeState)
+                sapPtr sapLen
+                orchPtr orchLen
+                recoverHeight
+                spending
+                namePtr
+                keySourcePtr
+                nullPtr
+                0
+              if resultPtr == nullPtr
+                then do
+                  err <- getLastError
+                  return $ Left $ maybe "Unknown error" id err
+                else do
+                  result <- peek resultPtr
+                  let uuid = AccountId $ ffiUuidBytes result
+                  rs_free_uuid resultPtr
+                  return $ Right uuid
 
 -- | List all account IDs in the wallet.
-listAccounts :: FilePath -> Network -> IO (Either Text [AccountId])
-listAccounts dbPath network = do
-  let pathBS = TE.encodeUtf8 (pack dbPath)
-  BSU.unsafeUseAsCStringLen pathBS $ \(pathPtr, pathLen) -> do
-    resultPtr <- rs_list_accounts (castPtr pathPtr) (fromIntegral pathLen) (networkId network)
-    if resultPtr == nullPtr
-      then do
-        err <- getLastError
-        return $ Left $ maybe "Unknown error" id err
-      else do
-        result <- peek resultPtr
-        let len = fromIntegral $ ffiAccountsLen result
-        uuids <- if len > 0
-          then do
-            rawUuids <- peekArray len (ffiAccountsPtr result)
-            return $ map (AccountId . ffiUuidBytes) rawUuids
-          else return []
-        rs_free_accounts resultPtr
-        return $ Right uuids
+listAccounts :: WalletHandle -> IO (Either Text [AccountId])
+listAccounts (WalletHandle handle) = do
+  resultPtr <- rs_list_accounts handle
+  if resultPtr == nullPtr
+    then do
+      err <- getLastError
+      return $ Left $ maybe "Unknown error" id err
+    else do
+      result <- peek resultPtr
+      let len = fromIntegral $ ffiAccountsLen result
+      uuids <- if len > 0
+        then do
+          rawUuids <- peekArray len (ffiAccountsPtr result)
+          return $ map (AccountId . ffiUuidBytes) rawUuids
+        else return []
+      rs_free_accounts resultPtr
+      return $ Right uuids
 
 -- | Get detailed information about an account.
-getAccount :: FilePath -> Network -> AccountId -> IO (Either Text (Maybe Account))
-getAccount dbPath network (AccountId uuid) = do
-  let pathBS = TE.encodeUtf8 (pack dbPath)
-  BSU.unsafeUseAsCStringLen pathBS $ \(pathPtr, pathLen) ->
-    BSU.unsafeUseAsCStringLen uuid $ \(uuidPtr, _) -> do
-      resultPtr <- rs_get_account
-        (castPtr pathPtr) (fromIntegral pathLen)
-        (networkId network)
-        (castPtr uuidPtr)
-      if resultPtr == nullPtr
-        then return $ Right Nothing
-        else do
-          result <- peek resultPtr
-          nameStr <- if ffiAccountName result /= nullPtr
-            then Just . pack <$> peekCString (ffiAccountName result)
-            else return $ Just ""
-          keySourceStr <- if ffiAccountKeySource result /= nullPtr
-            then Just . pack <$> peekCString (ffiAccountKeySource result)
-            else return Nothing
-          ufvkStr <- if ffiAccountUfvk result /= nullPtr
-            then Just . pack <$> peekCString (ffiAccountUfvk result)
-            else return Nothing
-          uivkStr <- if ffiAccountUivk result /= nullPtr
-            then Just . pack <$> peekCString (ffiAccountUivk result)
-            else return Nothing
-          let CBool hasSpend = ffiAccountHasSpendKey result
-          rs_free_account resultPtr
-          return $ Right $ Just Account
-            { accountId = AccountId $ ffiUuidBytes $ ffiAccountUuid result
-            , accountName = maybe "" id nameStr
-            , accountKeySource = keySourceStr
-            , accountUfvk = ufvkStr
-            , accountUivk = uivkStr
-            , accountHasSpendKey = hasSpend /= 0
-            }
+getAccount :: WalletHandle -> AccountId -> IO (Either Text (Maybe Account))
+getAccount (WalletHandle handle) (AccountId uuid) = do
+  BSU.unsafeUseAsCStringLen uuid $ \(uuidPtr, _) -> do
+    resultPtr <- rs_get_account handle (castPtr uuidPtr)
+    if resultPtr == nullPtr
+      then return $ Right Nothing
+      else do
+        result <- peek resultPtr
+        nameStr <- if ffiAccountName result /= nullPtr
+          then Just . pack <$> peekCString (ffiAccountName result)
+          else return $ Just ""
+        keySourceStr <- if ffiAccountKeySource result /= nullPtr
+          then Just . pack <$> peekCString (ffiAccountKeySource result)
+          else return Nothing
+        ufvkStr <- if ffiAccountUfvk result /= nullPtr
+          then Just . pack <$> peekCString (ffiAccountUfvk result)
+          else return Nothing
+        uivkStr <- if ffiAccountUivk result /= nullPtr
+          then Just . pack <$> peekCString (ffiAccountUivk result)
+          else return Nothing
+        let CBool hasSpend = ffiAccountHasSpendKey result
+        rs_free_account resultPtr
+        return $ Right $ Just Account
+          { accountId = AccountId $ ffiUuidBytes $ ffiAccountUuid result
+          , accountName = maybe "" id nameStr
+          , accountKeySource = keySourceStr
+          , accountUfvk = ufvkStr
+          , accountUivk = uivkStr
+          , accountHasSpendKey = hasSpend /= 0
+          }
 
 -- | Compute the seed fingerprint for a given seed.
 seedFingerprint :: ByteString -> IO (Either Text ByteString)
@@ -350,46 +377,34 @@ seedFingerprint seed = do
 -- ============================================================================
 
 -- | Get the current default address for an account.
-getCurrentAddress :: FilePath -> AccountId -> Network -> IO (Either Text (Maybe Text))
-getCurrentAddress dbPath (AccountId uuid) network = do
-  let pathBS = TE.encodeUtf8 (pack dbPath)
-  BSU.unsafeUseAsCStringLen pathBS $ \(pathPtr, pathLen) ->
-    BSU.unsafeUseAsCStringLen uuid $ \(uuidPtr, _) -> do
-      resultPtr <- rs_get_current_address
-        (castPtr pathPtr) (fromIntegral pathLen)
-        (castPtr uuidPtr)
-        (networkId network)
-      if resultPtr == nullPtr
-        then return $ Right Nothing
-        else do
-          addr <- pack <$> peekCString resultPtr
-          rs_string_free resultPtr
-          return $ Right $ Just addr
+getCurrentAddress :: WalletHandle -> AccountId -> IO (Either Text (Maybe Text))
+getCurrentAddress (WalletHandle handle) (AccountId uuid) = do
+  BSU.unsafeUseAsCStringLen uuid $ \(uuidPtr, _) -> do
+    resultPtr <- rs_get_current_address handle (castPtr uuidPtr)
+    if resultPtr == nullPtr
+      then return $ Right Nothing
+      else do
+        addr <- pack <$> peekCString resultPtr
+        rs_string_free resultPtr
+        return $ Right $ Just addr
 
 -- | Get the next available address for an account with specified receiver types.
 getNextAvailableAddress
-  :: FilePath
+  :: WalletHandle
   -> AccountId
-  -> Network
   -> ReceiverFlags
   -> IO (Either Text (Maybe Text))
-getNextAvailableAddress dbPath (AccountId uuid) network flags = do
-  let pathBS = TE.encodeUtf8 (pack dbPath)
+getNextAvailableAddress (WalletHandle handle) (AccountId uuid) flags = do
   let request = (if receiverFlagsSapling flags then 0x2 else 0)
               + (if receiverFlagsOrchard flags then 0x4 else 0)
-  BSU.unsafeUseAsCStringLen pathBS $ \(pathPtr, pathLen) ->
-    BSU.unsafeUseAsCStringLen uuid $ \(uuidPtr, _) -> do
-      resultPtr <- rs_get_next_available_address
-        (castPtr pathPtr) (fromIntegral pathLen)
-        (castPtr uuidPtr)
-        (networkId network)
-        request
-      if resultPtr == nullPtr
-        then return $ Right Nothing
-        else do
-          addr <- pack <$> peekCString resultPtr
-          rs_string_free resultPtr
-          return $ Right $ Just addr
+  BSU.unsafeUseAsCStringLen uuid $ \(uuidPtr, _) -> do
+    resultPtr <- rs_get_next_available_address handle (castPtr uuidPtr) request
+    if resultPtr == nullPtr
+      then return $ Right Nothing
+      else do
+        addr <- pack <$> peekCString resultPtr
+        rs_string_free resultPtr
+        return $ Right $ Just addr
 
 -- ============================================================================
 -- Address Validation
@@ -407,40 +422,35 @@ isValidShieldedAddress network addr =
 -- ============================================================================
 
 -- | Get the wallet summary including all account balances and sync progress.
-getWalletSummary :: FilePath -> Network -> Word32 -> IO (Either Text (Maybe WalletSummary))
-getWalletSummary dbPath network minConfirmations = do
-  let pathBS = TE.encodeUtf8 (pack dbPath)
-  BSU.unsafeUseAsCStringLen pathBS $ \(pathPtr, pathLen) -> do
-    resultPtr <- rs_get_wallet_summary
-      (castPtr pathPtr) (fromIntegral pathLen)
-      (networkId network)
-      minConfirmations
-    if resultPtr == nullPtr
-      then return $ Right Nothing
-      else do
-        result <- peek resultPtr
-        let balLen = fromIntegral $ ffiWalletSummaryBalancesLen result
-        balances <- if balLen > 0
-          then do
-            rawBalances <- peekArray balLen (ffiWalletSummaryBalances result)
-            return $ map convertBalance rawBalances
-          else return []
-        let chainTip = if ffiWalletSummaryChainTip result >= 0
-              then Just $ BlockHeight $ fromIntegral $ ffiWalletSummaryChainTip result
-              else Nothing
-        let fullyScanned = if ffiWalletSummaryFullyScanned result >= 0
-              then Just $ BlockHeight $ fromIntegral $ ffiWalletSummaryFullyScanned result
-              else Nothing
-        rs_free_wallet_summary resultPtr
-        return $ Right $ Just WalletSummary
-          { walletSummaryAccountBalances = balances
-          , walletSummaryChainTipHeight = chainTip
-          , walletSummaryFullyScannedHeight = fullyScanned
-          , walletSummaryScanProgressNumerator = ffiWalletSummaryScanNumerator result
-          , walletSummaryScanProgressDenominator = ffiWalletSummaryScanDenominator result
-          , walletSummaryNextSaplingSubtreeIndex = ffiWalletSummaryNextSapling result
-          , walletSummaryNextOrchardSubtreeIndex = ffiWalletSummaryNextOrchard result
-          }
+getWalletSummary :: WalletHandle -> Word32 -> IO (Either Text (Maybe WalletSummary))
+getWalletSummary (WalletHandle handle) minConfirmations = do
+  resultPtr <- rs_get_wallet_summary handle minConfirmations
+  if resultPtr == nullPtr
+    then return $ Right Nothing
+    else do
+      result <- peek resultPtr
+      let balLen = fromIntegral $ ffiWalletSummaryBalancesLen result
+      balances <- if balLen > 0
+        then do
+          rawBalances <- peekArray balLen (ffiWalletSummaryBalances result)
+          return $ map convertBalance rawBalances
+        else return []
+      let chainTip = if ffiWalletSummaryChainTip result >= 0
+            then Just $ BlockHeight $ fromIntegral $ ffiWalletSummaryChainTip result
+            else Nothing
+      let fullyScanned = if ffiWalletSummaryFullyScanned result >= 0
+            then Just $ BlockHeight $ fromIntegral $ ffiWalletSummaryFullyScanned result
+            else Nothing
+      rs_free_wallet_summary resultPtr
+      return $ Right $ Just WalletSummary
+        { walletSummaryAccountBalances = balances
+        , walletSummaryChainTipHeight = chainTip
+        , walletSummaryFullyScannedHeight = fullyScanned
+        , walletSummaryScanProgressNumerator = ffiWalletSummaryScanNumerator result
+        , walletSummaryScanProgressDenominator = ffiWalletSummaryScanDenominator result
+        , walletSummaryNextSaplingSubtreeIndex = ffiWalletSummaryNextSapling result
+        , walletSummaryNextOrchardSubtreeIndex = ffiWalletSummaryNextOrchard result
+        }
   where
     convertBalance :: FfiAccountBalance -> AccountBalance
     convertBalance ab = AccountBalance
@@ -460,54 +470,41 @@ getWalletSummary dbPath network minConfirmations = do
 -- ============================================================================
 
 -- | Update the chain tip height in the wallet database.
-updateChainTip :: FilePath -> BlockHeight -> Network -> IO (Either Text ())
-updateChainTip dbPath (BlockHeight height) network = do
-  let pathBS = TE.encodeUtf8 (pack dbPath)
-  BSU.unsafeUseAsCStringLen pathBS $ \(pathPtr, pathLen) -> do
-    CBool result <- rs_update_chain_tip
-      (castPtr pathPtr) (fromIntegral pathLen)
-      height
-      (networkId network)
-    if result /= 0
-      then return $ Right ()
-      else do
-        err <- getLastError
-        return $ Left $ maybe "Unknown error" id err
+updateChainTip :: WalletHandle -> BlockHeight -> IO (Either Text ())
+updateChainTip (WalletHandle handle) (BlockHeight height) = do
+  CBool result <- rs_update_chain_tip handle height
+  if result /= 0
+    then return $ Right ()
+    else do
+      err <- getLastError
+      return $ Left $ maybe "Unknown error" id err
 
 -- | Get the fully scanned height.
-fullyScannedHeight :: FilePath -> Network -> IO (Either Text (Maybe BlockHeight))
-fullyScannedHeight dbPath network = do
-  let pathBS = TE.encodeUtf8 (pack dbPath)
-  BSU.unsafeUseAsCStringLen pathBS $ \(pathPtr, pathLen) -> do
-    result <- rs_fully_scanned_height
-      (castPtr pathPtr) (fromIntegral pathLen)
-      (networkId network)
-    if result >= 0
-      then return $ Right $ Just $ BlockHeight $ fromIntegral result
-      else return $ Right Nothing
+fullyScannedHeight :: WalletHandle -> IO (Either Text (Maybe BlockHeight))
+fullyScannedHeight (WalletHandle handle) = do
+  result <- rs_fully_scanned_height handle
+  if result >= 0
+    then return $ Right $ Just $ BlockHeight $ fromIntegral result
+    else return $ Right Nothing
 
 -- | Get the suggested scan ranges for syncing.
-suggestScanRanges :: FilePath -> Network -> IO (Either Text [ScanRange])
-suggestScanRanges dbPath network = do
-  let pathBS = TE.encodeUtf8 (pack dbPath)
-  BSU.unsafeUseAsCStringLen pathBS $ \(pathPtr, pathLen) -> do
-    resultPtr <- rs_suggest_scan_ranges
-      (castPtr pathPtr) (fromIntegral pathLen)
-      (networkId network)
-    if resultPtr == nullPtr
-      then do
-        err <- getLastError
-        return $ Left $ maybe "Unknown error" id err
-      else do
-        result <- peek resultPtr
-        let len = fromIntegral $ ffiScanRangesLen result
-        ranges <- if len > 0
-          then do
-            rawRanges <- peekArray len (ffiScanRangesPtr result)
-            return $ map convertRange rawRanges
-          else return []
-        rs_free_scan_ranges resultPtr
-        return $ Right ranges
+suggestScanRanges :: WalletHandle -> IO (Either Text [ScanRange])
+suggestScanRanges (WalletHandle handle) = do
+  resultPtr <- rs_suggest_scan_ranges handle
+  if resultPtr == nullPtr
+    then do
+      err <- getLastError
+      return $ Left $ maybe "Unknown error" id err
+    else do
+      result <- peek resultPtr
+      let len = fromIntegral $ ffiScanRangesLen result
+      ranges <- if len > 0
+        then do
+          rawRanges <- peekArray len (ffiScanRangesPtr result)
+          return $ map convertRange rawRanges
+        else return []
+      rs_free_scan_ranges resultPtr
+      return $ Right ranges
   where
     convertRange :: FfiScanRange -> ScanRange
     convertRange r = ScanRange

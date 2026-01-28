@@ -14,6 +14,11 @@ module Lrzhs.Ffi
   , rs_init_data_database
   , rs_init_block_metadata_db
 
+    -- * Wallet Handle Management
+  , rs_open_wallet
+  , rs_close_wallet
+  , DbHandle
+
     -- * Account Management
   , rs_create_account
   , rs_import_account_ufvk
@@ -408,12 +413,25 @@ foreign import ccall "lrzhs_init_block_metadata_db"
   rs_init_block_metadata_db :: Ptr Word8 -> CSize -> IO CBool
 
 -- ============================================================================
+-- Wallet Handle Management
+-- ============================================================================
+
+-- | Opaque handle to an open wallet database connection.
+data DbHandle
+
+foreign import ccall "lrzhs_open_wallet"
+  rs_open_wallet :: Ptr Word8 -> CSize -> CUInt -> IO (Ptr DbHandle)
+
+foreign import ccall "lrzhs_close_wallet"
+  rs_close_wallet :: Ptr DbHandle -> IO ()
+
+-- ============================================================================
 -- Account Management
 -- ============================================================================
 
 foreign import ccall "lrzhs_create_account"
   rs_create_account
-    :: Ptr Word8 -> CSize        -- db_data
+    :: Ptr DbHandle              -- handle
     -> Ptr Word8 -> CSize        -- seed
     -> Word32                    -- treestate_height
     -> Ptr Word8                 -- treestate_hash
@@ -421,14 +439,13 @@ foreign import ccall "lrzhs_create_account"
     -> Ptr Word8 -> CSize        -- treestate_sapling_tree
     -> Ptr Word8 -> CSize        -- treestate_orchard_tree
     -> Int64                     -- recover_until
-    -> CUInt                     -- network_id
     -> CString                   -- account_name
     -> CString                   -- key_source
     -> IO (Ptr FfiCreateAccountResult)
 
 foreign import ccall "lrzhs_import_account_ufvk"
   rs_import_account_ufvk
-    :: Ptr Word8 -> CSize        -- db_data
+    :: Ptr DbHandle              -- handle
     -> CString                   -- ufvk
     -> Word32                    -- treestate_height
     -> Ptr Word8                 -- treestate_hash
@@ -436,7 +453,6 @@ foreign import ccall "lrzhs_import_account_ufvk"
     -> Ptr Word8 -> CSize        -- treestate_sapling_tree
     -> Ptr Word8 -> CSize        -- treestate_orchard_tree
     -> Int64                     -- recover_until
-    -> CUInt                     -- network_id
     -> CBool                     -- spending
     -> CString                   -- account_name
     -> CString                   -- key_source
@@ -445,10 +461,10 @@ foreign import ccall "lrzhs_import_account_ufvk"
     -> IO (Ptr FfiUuid)
 
 foreign import ccall "lrzhs_list_accounts"
-  rs_list_accounts :: Ptr Word8 -> CSize -> CUInt -> IO (Ptr FfiAccounts)
+  rs_list_accounts :: Ptr DbHandle -> IO (Ptr FfiAccounts)
 
 foreign import ccall "lrzhs_get_account"
-  rs_get_account :: Ptr Word8 -> CSize -> CUInt -> Ptr Word8 -> IO (Ptr FfiAccount)
+  rs_get_account :: Ptr DbHandle -> Ptr Word8 -> IO (Ptr FfiAccount)
 
 foreign import ccall "lrzhs_seed_fingerprint"
   rs_seed_fingerprint :: Ptr Word8 -> CSize -> Ptr Word8 -> IO CBool
@@ -458,30 +474,30 @@ foreign import ccall "lrzhs_seed_fingerprint"
 -- ============================================================================
 
 foreign import ccall "lrzhs_get_current_address"
-  rs_get_current_address :: Ptr Word8 -> CSize -> Ptr Word8 -> CUInt -> IO CString
+  rs_get_current_address :: Ptr DbHandle -> Ptr Word8 -> IO CString
 
 foreign import ccall "lrzhs_get_next_available_address"
-  rs_get_next_available_address :: Ptr Word8 -> CSize -> Ptr Word8 -> CUInt -> Word8 -> IO CString
+  rs_get_next_available_address :: Ptr DbHandle -> Ptr Word8 -> Word8 -> IO CString
 
 -- ============================================================================
 -- Wallet Summary
 -- ============================================================================
 
 foreign import ccall "lrzhs_get_wallet_summary"
-  rs_get_wallet_summary :: Ptr Word8 -> CSize -> CUInt -> Word32 -> IO (Ptr FfiWalletSummary)
+  rs_get_wallet_summary :: Ptr DbHandle -> Word32 -> IO (Ptr FfiWalletSummary)
 
 -- ============================================================================
 -- Blockchain Synchronization
 -- ============================================================================
 
 foreign import ccall "lrzhs_update_chain_tip"
-  rs_update_chain_tip :: Ptr Word8 -> CSize -> Word32 -> CUInt -> IO CBool
+  rs_update_chain_tip :: Ptr DbHandle -> Word32 -> IO CBool
 
 foreign import ccall "lrzhs_fully_scanned_height"
-  rs_fully_scanned_height :: Ptr Word8 -> CSize -> CUInt -> IO Int64
+  rs_fully_scanned_height :: Ptr DbHandle -> IO Int64
 
 foreign import ccall "lrzhs_suggest_scan_ranges"
-  rs_suggest_scan_ranges :: Ptr Word8 -> CSize -> CUInt -> IO (Ptr FfiScanRanges)
+  rs_suggest_scan_ranges :: Ptr DbHandle -> IO (Ptr FfiScanRanges)
 
 foreign import ccall "lrzhs_write_block_metadata"
   rs_write_block_metadata :: Ptr Word8 -> CSize -> Ptr FfiBlockMeta -> CSize -> IO CBool

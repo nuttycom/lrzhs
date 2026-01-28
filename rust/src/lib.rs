@@ -4,6 +4,7 @@
 //! functionality through a C FFI for use by Haskell.
 
 use std::ffi::{c_char, CStr, CString};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rand::rngs::OsRng;
@@ -15,6 +16,7 @@ use zcash_client_backend::data_api::scanning::ScanPriority;
 use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 use zcash_client_backend::data_api::{
     Account, AccountBirthday, AccountPurpose, AccountSource, WalletRead, WalletWrite,
+    Zip32Derivation,
 };
 use zcash_client_backend::keys::UnifiedFullViewingKey;
 
@@ -24,15 +26,18 @@ use zcash_client_sqlite::{AccountUuid, WalletDb};
 
 // These types come from the re-exported versions via zcash_client_backend
 use zcash_client_backend::keys::UnifiedAddressRequest;
-use zcash_client_backend::encoding::AddressCodec;
+
+// Tree reading for account birthday parsing
+use zcash_primitives::merkle_tree::read_commitment_tree;
+use sapling::NOTE_COMMITMENT_TREE_DEPTH as SAPLING_DEPTH;
+use orchard::NOTE_COMMITMENT_TREE_DEPTH as ORCHARD_DEPTH;
+use orchard::tree::MerkleHashOrchard;
+use sapling::Node as SaplingNode;
 
 mod ffi;
 
 use ffi::*;
 
-// Type aliases for secrecy types - we need to use the same version as zcash_client_backend
-// The secrecy crate 0.8 has SecretVec
-extern crate secrecy;
 use secrecy::SecretVec;
 
 // ============================================================================
@@ -95,17 +100,11 @@ pub extern "C" fn lrzhs_clear_last_error() {
 // Network Helpers
 // ============================================================================
 
-// Import consensus types from zcash_client_backend's re-exports
-use zcash_client_backend::proto::compact_formats::ChainMetadata;
-
-// We need to use the proper consensus Parameters trait
-// Import from zcash_primitives which is pulled in by zcash_client_backend
-extern crate zcash_primitives;
 use zcash_primitives::block::BlockHash;
 use zcash_primitives::consensus::{BlockHeight, MainNetwork, NetworkType, Parameters, TestNetwork};
 
 #[derive(Clone, Copy)]
-enum Network {
+pub enum Network {
     Main,
     Test,
 }
@@ -170,11 +169,79 @@ fn open_wallet_db(
     })
 }
 
+// Helper to parse tree state from FFI parameters into ChainState.
+//
+// The tree bytes should be raw binary (not hex-encoded) commitment tree data
+// in the legacy format used by lightwalletd's TreeState.
+fn parse_chain_state(
+    height: u32,
+    hash: *const u8,
+    _time: u32,
+    sapling_tree: *const u8,
+    sapling_tree_len: usize,
+    orchard_tree: *const u8,
+    orchard_tree_len: usize,
+) -> Result<ChainState, ()> {
+    // Parse block hash (required, 32 bytes)
+    let block_hash = if hash.is_null() {
+        ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+            "Block hash is required for tree state"
+        ));
+        return Err(());
+    } else {
+        let hash_bytes: [u8; 32] = unsafe { std::slice::from_raw_parts(hash, 32) }
+            .try_into()
+            .map_err(|_| {
+                ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+                    "Invalid block hash length"
+                ));
+            })?;
+        BlockHash(hash_bytes)
+    };
+
+    // Parse Sapling commitment tree and convert to frontier
+    let sapling_frontier = if sapling_tree.is_null() || sapling_tree_len == 0 {
+        incrementalmerkletree::frontier::Frontier::empty()
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(sapling_tree, sapling_tree_len) };
+        let tree = read_commitment_tree::<SaplingNode, _, SAPLING_DEPTH>(bytes).map_err(|e| {
+            ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+                "Failed to parse Sapling commitment tree: {}",
+                e
+            ));
+        })?;
+        tree.to_frontier()
+    };
+
+    // Parse Orchard commitment tree and convert to frontier
+    let orchard_frontier = if orchard_tree.is_null() || orchard_tree_len == 0 {
+        incrementalmerkletree::frontier::Frontier::empty()
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(orchard_tree, orchard_tree_len) };
+        let tree =
+            read_commitment_tree::<MerkleHashOrchard, _, { ORCHARD_DEPTH as u8 }>(bytes).map_err(
+                |e| {
+                    ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+                        "Failed to parse Orchard commitment tree: {}",
+                        e
+                    ));
+                },
+            )?;
+        tree.to_frontier()
+    };
+
+    Ok(ChainState::new(
+        BlockHeight::from_u32(height),
+        block_hash,
+        sapling_frontier,
+        orchard_frontier,
+    ))
+}
+
 // ============================================================================
 // Address Validation
 // ============================================================================
 
-extern crate zcash_address;
 use zcash_address::unified::Container;
 use zcash_address::{ConversionError, TryFromAddress, ZcashAddress};
 
@@ -335,29 +402,27 @@ pub unsafe extern "C" fn lrzhs_init_block_metadata_db(
 }
 
 // ============================================================================
-// Account Management
+// Wallet Handle Management
 // ============================================================================
 
-// Import zip32 types that are re-exported through zcash_client_backend
-extern crate zip32;
-use zip32::fingerprint::SeedFingerprint;
-
-// Import zcash_keys for UnifiedSpendingKey and Era
-extern crate zcash_keys;
-use zcash_keys::keys::{Era, UnifiedSpendingKey};
-
+/// Opens a wallet database and returns an opaque handle.
+///
+/// The handle should be passed to subsequent wallet operations and must be
+/// closed with `lrzhs_close_wallet` when no longer needed.
+///
+/// # Safety
+/// - `db_data` must be a valid pointer to a UTF-8 encoded path string.
+/// - The caller must eventually call `lrzhs_close_wallet` to free the handle.
+///
+/// # Returns
+/// A pointer to a `DbHandle` on success, or null on failure.
+/// Call `lrzhs_last_error_length` and `lrzhs_error_message_utf8` to get error details.
 #[no_mangle]
-pub unsafe extern "C" fn lrzhs_create_account(
+pub unsafe extern "C" fn lrzhs_open_wallet(
     db_data: *const u8,
     db_data_len: usize,
-    seed: *const u8,
-    seed_len: usize,
-    birthday_height: u32,
-    recover_until: i64,
     network_id: u32,
-    account_name: *const c_char,
-    key_source: *const c_char,
-) -> *mut FfiCreateAccountResult {
+) -> *mut ffi::DbHandle {
     let res = std::panic::catch_unwind(|| {
         let network = parse_network(network_id)?;
 
@@ -371,6 +436,53 @@ pub unsafe extern "C" fn lrzhs_create_account(
             })?
         };
 
+        let db = open_wallet_db(db_path, network)?;
+
+        Ok(Box::into_raw(Box::new(ffi::DbHandle { db, network })))
+    });
+
+    match res {
+        Ok(inner) => unwrap_exc_or(inner, std::ptr::null_mut()),
+        Err(_) => {
+            ffi_helpers::error_handling::update_last_error(anyhow::anyhow!("Panic occurred"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+// ============================================================================
+// Account Management
+// ============================================================================
+
+use zip32::fingerprint::SeedFingerprint;
+use zcash_keys::keys::Era;
+
+#[no_mangle]
+pub unsafe extern "C" fn lrzhs_create_account(
+    handle: *mut ffi::DbHandle,
+    seed: *const u8,
+    seed_len: usize,
+    treestate_height: u32,
+    treestate_hash: *const u8,
+    treestate_time: u32,
+    treestate_sapling_tree: *const u8,
+    treestate_sapling_tree_len: usize,
+    treestate_orchard_tree: *const u8,
+    treestate_orchard_tree_len: usize,
+    recover_until: i64,
+    account_name: *const c_char,
+    key_source: *const c_char,
+) -> *mut FfiCreateAccountResult {
+    let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+                "Wallet handle is null"
+            ));
+            return Err(());
+        }
+
+        let db_handle = unsafe { &mut *handle };
+
         if seed.is_null() || seed_len == 0 {
             ffi_helpers::error_handling::update_last_error(anyhow::anyhow!("Seed is required"));
             return Err(());
@@ -379,12 +491,16 @@ pub unsafe extern "C" fn lrzhs_create_account(
         let seed_secret =
             SecretVec::new(unsafe { std::slice::from_raw_parts(seed, seed_len) }.to_vec());
 
-        // Create a ChainState with empty frontiers for the birthday
-        // This represents the state prior to the birthday block
-        let prior_chain_state = ChainState::empty(
-            BlockHeight::from_u32(birthday_height.saturating_sub(1)),
-            BlockHash([0u8; 32]),
-        );
+        // Parse the tree state for the account birthday
+        let prior_chain_state = parse_chain_state(
+            treestate_height.saturating_sub(1),
+            treestate_hash,
+            treestate_time,
+            treestate_sapling_tree,
+            treestate_sapling_tree_len,
+            treestate_orchard_tree,
+            treestate_orchard_tree_len,
+        )?;
 
         let recover_until_height = if recover_until >= 0 {
             Some(BlockHeight::from_u32(recover_until as u32))
@@ -414,9 +530,8 @@ pub unsafe extern "C" fn lrzhs_create_account(
             )
         };
 
-        let mut db = open_wallet_db(db_path, network)?;
-
-        let (account_id, usk) = db
+        let (account_id, usk) = db_handle
+            .db
             .create_account(&name, &seed_secret, &birthday, key_src.as_deref())
             .map_err(|e| {
                 ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
@@ -434,7 +549,8 @@ pub unsafe extern "C" fn lrzhs_create_account(
             ptr
         };
 
-        let account_uuid = db
+        let account_uuid = db_handle
+            .db
             .get_account(account_id)
             .map_err(|e| {
                 ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
@@ -454,7 +570,7 @@ pub unsafe extern "C" fn lrzhs_create_account(
             usk: usk_ptr,
             usk_len,
         })))
-    });
+    }));
 
     match res {
         Ok(inner) => unwrap_exc_or(inner, std::ptr::null_mut()),
@@ -467,28 +583,31 @@ pub unsafe extern "C" fn lrzhs_create_account(
 
 #[no_mangle]
 pub unsafe extern "C" fn lrzhs_import_account_ufvk(
-    db_data: *const u8,
-    db_data_len: usize,
+    handle: *mut ffi::DbHandle,
     ufvk: *const c_char,
-    birthday_height: u32,
+    treestate_height: u32,
+    treestate_hash: *const u8,
+    treestate_time: u32,
+    treestate_sapling_tree: *const u8,
+    treestate_sapling_tree_len: usize,
+    treestate_orchard_tree: *const u8,
+    treestate_orchard_tree_len: usize,
     recover_until: i64,
-    network_id: u32,
     spending: bool,
     account_name: *const c_char,
     key_source: *const c_char,
+    seed_fingerprint: *const u8,
+    hd_account_index: u32,
 ) -> *mut FfiUuid {
-    let res = std::panic::catch_unwind(|| {
-        let network = parse_network(network_id)?;
+    let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+                "Wallet handle is null"
+            ));
+            return Err(());
+        }
 
-        let db_path = unsafe {
-            let slice = std::slice::from_raw_parts(db_data, db_data_len);
-            std::str::from_utf8(slice).map_err(|e| {
-                ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
-                    "Invalid UTF-8 in database path: {}",
-                    e
-                ));
-            })?
-        };
+        let db_handle = unsafe { &mut *handle };
 
         let ufvk_str = if ufvk.is_null() {
             ffi_helpers::error_handling::update_last_error(anyhow::anyhow!("UFVK is required"));
@@ -503,18 +622,23 @@ pub unsafe extern "C" fn lrzhs_import_account_ufvk(
         };
 
         let ufvk_parsed =
-            UnifiedFullViewingKey::decode(&network, ufvk_str).map_err(|e| {
+            UnifiedFullViewingKey::decode(&db_handle.network, ufvk_str).map_err(|e| {
                 ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
                     "Failed to decode UFVK: {}",
                     e
                 ));
             })?;
 
-        // Create a ChainState with empty frontiers for the birthday
-        let prior_chain_state = ChainState::empty(
-            BlockHeight::from_u32(birthday_height.saturating_sub(1)),
-            BlockHash([0u8; 32]),
-        );
+        // Parse the tree state for the account birthday
+        let prior_chain_state = parse_chain_state(
+            treestate_height.saturating_sub(1),
+            treestate_hash,
+            treestate_time,
+            treestate_sapling_tree,
+            treestate_sapling_tree_len,
+            treestate_orchard_tree,
+            treestate_orchard_tree_len,
+        )?;
 
         let recover_until_height = if recover_until >= 0 {
             Some(BlockHeight::from_u32(recover_until as u32))
@@ -544,15 +668,34 @@ pub unsafe extern "C" fn lrzhs_import_account_ufvk(
             )
         };
 
+        // Parse derivation info if seed fingerprint is provided
+        let derivation = if !seed_fingerprint.is_null() {
+            let fp_bytes: [u8; 32] = unsafe { std::slice::from_raw_parts(seed_fingerprint, 32) }
+                .try_into()
+                .map_err(|_| {
+                    ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+                        "Invalid seed fingerprint length"
+                    ));
+                })?;
+            let fp = SeedFingerprint::from_bytes(fp_bytes);
+            let account_id = zip32::AccountId::try_from(hd_account_index).map_err(|_| {
+                ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+                    "Invalid HD account index"
+                ));
+            })?;
+            Some(Zip32Derivation::new(fp, account_id))
+        } else {
+            None
+        };
+
         let purpose = if spending {
-            AccountPurpose::Spending { derivation: None }
+            AccountPurpose::Spending { derivation }
         } else {
             AccountPurpose::ViewOnly
         };
 
-        let mut db = open_wallet_db(db_path, network)?;
-
-        let account = db
+        let account = db_handle
+            .db
             .import_account_ufvk(&name, &ufvk_parsed, &birthday, purpose, key_src.as_deref())
             .map_err(|e| {
                 ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
@@ -562,7 +705,7 @@ pub unsafe extern "C" fn lrzhs_import_account_ufvk(
             })?;
 
         Ok(Box::into_raw(Box::new(FfiUuid::from_account_uuid(account.id()))))
-    });
+    }));
 
     match res {
         Ok(inner) => unwrap_exc_or(inner, std::ptr::null_mut()),
@@ -575,26 +718,19 @@ pub unsafe extern "C" fn lrzhs_import_account_ufvk(
 
 #[no_mangle]
 pub unsafe extern "C" fn lrzhs_list_accounts(
-    db_data: *const u8,
-    db_data_len: usize,
-    network_id: u32,
+    handle: *mut ffi::DbHandle,
 ) -> *mut FfiAccounts {
-    let res = std::panic::catch_unwind(|| {
-        let network = parse_network(network_id)?;
+    let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+                "Wallet handle is null"
+            ));
+            return Err(());
+        }
 
-        let db_path = unsafe {
-            let slice = std::slice::from_raw_parts(db_data, db_data_len);
-            std::str::from_utf8(slice).map_err(|e| {
-                ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
-                    "Invalid UTF-8 in database path: {}",
-                    e
-                ));
-            })?
-        };
+        let db_handle = unsafe { &*handle };
 
-        let db = open_wallet_db(db_path, network)?;
-
-        let accounts = db.get_account_ids().map_err(|e| {
+        let accounts = db_handle.db.get_account_ids().map_err(|e| {
             ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
                 "Failed to list accounts: {}",
                 e
@@ -617,7 +753,7 @@ pub unsafe extern "C" fn lrzhs_list_accounts(
             accounts: ptr,
             len,
         })))
-    });
+    }));
 
     match res {
         Ok(inner) => unwrap_exc_or(inner, std::ptr::null_mut()),
@@ -630,23 +766,18 @@ pub unsafe extern "C" fn lrzhs_list_accounts(
 
 #[no_mangle]
 pub unsafe extern "C" fn lrzhs_get_account(
-    db_data: *const u8,
-    db_data_len: usize,
-    network_id: u32,
+    handle: *mut ffi::DbHandle,
     account_uuid_bytes: *const u8,
 ) -> *mut FfiAccount {
-    let res = std::panic::catch_unwind(|| {
-        let network = parse_network(network_id)?;
+    let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+                "Wallet handle is null"
+            ));
+            return Err(());
+        }
 
-        let db_path = unsafe {
-            let slice = std::slice::from_raw_parts(db_data, db_data_len);
-            std::str::from_utf8(slice).map_err(|e| {
-                ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
-                    "Invalid UTF-8 in database path: {}",
-                    e
-                ));
-            })?
-        };
+        let db_handle = unsafe { &*handle };
 
         let account_uuid = if account_uuid_bytes.is_null() {
             ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
@@ -664,9 +795,7 @@ pub unsafe extern "C" fn lrzhs_get_account(
             AccountUuid::from_uuid(Uuid::from_bytes(bytes))
         };
 
-        let db = open_wallet_db(db_path, network)?;
-
-        let account = db.get_account(account_uuid).map_err(|e| {
+        let account = db_handle.db.get_account(account_uuid).map_err(|e| {
             ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
                 "Failed to get account: {}",
                 e
@@ -692,12 +821,12 @@ pub unsafe extern "C" fn lrzhs_get_account(
 
                 let ufvk_ptr = acc
                     .ufvk()
-                    .map(|ufvk| CString::new(ufvk.encode(&network)).unwrap().into_raw())
+                    .map(|ufvk| CString::new(ufvk.encode(&db_handle.network)).unwrap().into_raw())
                     .unwrap_or(std::ptr::null_mut());
 
                 // uivk() returns UnifiedIncomingViewingKey directly (not Option)
                 let uivk = acc.uivk();
-                let uivk_ptr = CString::new(uivk.encode(&network))
+                let uivk_ptr = CString::new(uivk.encode(&db_handle.network))
                     .unwrap()
                     .into_raw();
 
@@ -714,7 +843,7 @@ pub unsafe extern "C" fn lrzhs_get_account(
             }
             None => Ok(std::ptr::null_mut()),
         }
-    });
+    }));
 
     match res {
         Ok(inner) => unwrap_exc_or(inner, std::ptr::null_mut()),
@@ -778,23 +907,18 @@ pub unsafe extern "C" fn lrzhs_seed_fingerprint(
 
 #[no_mangle]
 pub unsafe extern "C" fn lrzhs_get_current_address(
-    db_data: *const u8,
-    db_data_len: usize,
+    handle: *mut ffi::DbHandle,
     account_uuid_bytes: *const u8,
-    network_id: u32,
 ) -> *mut c_char {
-    let res = std::panic::catch_unwind(|| {
-        let network = parse_network(network_id)?;
+    let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+                "Wallet handle is null"
+            ));
+            return Err(());
+        }
 
-        let db_path = unsafe {
-            let slice = std::slice::from_raw_parts(db_data, db_data_len);
-            std::str::from_utf8(slice).map_err(|e| {
-                ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
-                    "Invalid UTF-8 in database path: {}",
-                    e
-                ));
-            })?
-        };
+        let db_handle = unsafe { &*handle };
 
         let account_uuid = if account_uuid_bytes.is_null() {
             ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
@@ -812,11 +936,9 @@ pub unsafe extern "C" fn lrzhs_get_current_address(
             AccountUuid::from_uuid(Uuid::from_bytes(bytes))
         };
 
-        let db = open_wallet_db(db_path, network)?;
-
         // Use get_last_generated_address_matching which returns the most recently generated address
         // Use AllAvailableKeys to get any available address
-        let address = db.get_last_generated_address_matching(account_uuid, UnifiedAddressRequest::AllAvailableKeys).map_err(|e| {
+        let address = db_handle.db.get_last_generated_address_matching(account_uuid, UnifiedAddressRequest::AllAvailableKeys).map_err(|e| {
             ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
                 "Failed to get current address: {}",
                 e
@@ -825,7 +947,7 @@ pub unsafe extern "C" fn lrzhs_get_current_address(
 
         match address {
             Some(addr) => {
-                let addr_str = addr.encode(&network);
+                let addr_str = addr.encode(&db_handle.network);
                 let cstr = CString::new(addr_str).map_err(|e| {
                     ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
                         "Invalid address string: {}",
@@ -836,7 +958,7 @@ pub unsafe extern "C" fn lrzhs_get_current_address(
             }
             None => Ok(std::ptr::null_mut()),
         }
-    });
+    }));
 
     match res {
         Ok(inner) => unwrap_exc_or(inner, std::ptr::null_mut()),
@@ -849,24 +971,19 @@ pub unsafe extern "C" fn lrzhs_get_current_address(
 
 #[no_mangle]
 pub unsafe extern "C" fn lrzhs_get_next_available_address(
-    db_data: *const u8,
-    db_data_len: usize,
+    handle: *mut ffi::DbHandle,
     account_uuid_bytes: *const u8,
-    network_id: u32,
     request: u8,
 ) -> *mut c_char {
-    let res = std::panic::catch_unwind(|| {
-        let network = parse_network(network_id)?;
+    let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+                "Wallet handle is null"
+            ));
+            return Err(());
+        }
 
-        let db_path = unsafe {
-            let slice = std::slice::from_raw_parts(db_data, db_data_len);
-            std::str::from_utf8(slice).map_err(|e| {
-                ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
-                    "Invalid UTF-8 in database path: {}",
-                    e
-                ));
-            })?
-        };
+        let db_handle = unsafe { &mut *handle };
 
         let account_uuid = if account_uuid_bytes.is_null() {
             ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
@@ -883,8 +1000,6 @@ pub unsafe extern "C" fn lrzhs_get_next_available_address(
                 })?;
             AccountUuid::from_uuid(Uuid::from_bytes(bytes))
         };
-
-        let mut db = open_wallet_db(db_path, network)?;
 
         let has_sapling = (request & 0x2) != 0;
         let has_orchard = (request & 0x4) != 0;
@@ -914,7 +1029,8 @@ pub unsafe extern "C" fn lrzhs_get_next_available_address(
                 })?
         };
 
-        let result = db
+        let result = db_handle
+            .db
             .get_next_available_address(account_uuid, ua_request)
             .map_err(|e| {
                 ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
@@ -925,7 +1041,7 @@ pub unsafe extern "C" fn lrzhs_get_next_available_address(
 
         match result {
             Some((addr, _diversifier_index)) => {
-                let addr_str = addr.encode(&network);
+                let addr_str = addr.encode(&db_handle.network);
                 let cstr = CString::new(addr_str).map_err(|e| {
                     ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
                         "Invalid address string: {}",
@@ -936,7 +1052,7 @@ pub unsafe extern "C" fn lrzhs_get_next_available_address(
             }
             None => Ok(std::ptr::null_mut()),
         }
-    });
+    }));
 
     match res {
         Ok(inner) => unwrap_exc_or(inner, std::ptr::null_mut()),
@@ -953,28 +1069,21 @@ pub unsafe extern "C" fn lrzhs_get_next_available_address(
 
 #[no_mangle]
 pub unsafe extern "C" fn lrzhs_get_wallet_summary(
-    db_data: *const u8,
-    db_data_len: usize,
-    network_id: u32,
+    handle: *mut ffi::DbHandle,
     _min_confirmations: u32,
 ) -> *mut FfiWalletSummary {
-    let res = std::panic::catch_unwind(|| {
-        let network = parse_network(network_id)?;
+    let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+                "Wallet handle is null"
+            ));
+            return Err(());
+        }
 
-        let db_path = unsafe {
-            let slice = std::slice::from_raw_parts(db_data, db_data_len);
-            std::str::from_utf8(slice).map_err(|e| {
-                ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
-                    "Invalid UTF-8 in database path: {}",
-                    e
-                ));
-            })?
-        };
-
-        let db = open_wallet_db(db_path, network)?;
+        let db_handle = unsafe { &*handle };
 
         // Use the default confirmations policy for now
-        let summary = db.get_wallet_summary(ConfirmationsPolicy::default()).map_err(|e| {
+        let summary = db_handle.db.get_wallet_summary(ConfirmationsPolicy::default()).map_err(|e| {
             ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
                 "Failed to get wallet summary: {}",
                 e
@@ -1041,7 +1150,7 @@ pub unsafe extern "C" fn lrzhs_get_wallet_summary(
             }
             None => Ok(std::ptr::null_mut()),
         }
-    });
+    }));
 
     match res {
         Ok(inner) => unwrap_exc_or(inner, std::ptr::null_mut()),
@@ -1058,27 +1167,22 @@ pub unsafe extern "C" fn lrzhs_get_wallet_summary(
 
 #[no_mangle]
 pub unsafe extern "C" fn lrzhs_update_chain_tip(
-    db_data: *const u8,
-    db_data_len: usize,
+    handle: *mut ffi::DbHandle,
     height: u32,
-    network_id: u32,
 ) -> bool {
-    let res = std::panic::catch_unwind(|| {
-        let network = parse_network(network_id)?;
+    let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+                "Wallet handle is null"
+            ));
+            return Err(());
+        }
 
-        let db_path = unsafe {
-            let slice = std::slice::from_raw_parts(db_data, db_data_len);
-            std::str::from_utf8(slice).map_err(|e| {
-                ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
-                    "Invalid UTF-8 in database path: {}",
-                    e
-                ));
-            })?
-        };
+        let db_handle = unsafe { &mut *handle };
 
-        let mut db = open_wallet_db(db_path, network)?;
-
-        db.update_chain_tip(BlockHeight::from_u32(height))
+        db_handle
+            .db
+            .update_chain_tip(BlockHeight::from_u32(height))
             .map_err(|e| {
                 ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
                     "Failed to update chain tip: {}",
@@ -1087,7 +1191,7 @@ pub unsafe extern "C" fn lrzhs_update_chain_tip(
             })?;
 
         Ok(true)
-    });
+    }));
 
     match res {
         Ok(inner) => unwrap_exc_or(inner, false),
@@ -1100,26 +1204,19 @@ pub unsafe extern "C" fn lrzhs_update_chain_tip(
 
 #[no_mangle]
 pub unsafe extern "C" fn lrzhs_fully_scanned_height(
-    db_data: *const u8,
-    db_data_len: usize,
-    network_id: u32,
+    handle: *mut ffi::DbHandle,
 ) -> i64 {
-    let res = std::panic::catch_unwind(|| {
-        let network = parse_network(network_id)?;
+    let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+                "Wallet handle is null"
+            ));
+            return Err(());
+        }
 
-        let db_path = unsafe {
-            let slice = std::slice::from_raw_parts(db_data, db_data_len);
-            std::str::from_utf8(slice).map_err(|e| {
-                ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
-                    "Invalid UTF-8 in database path: {}",
-                    e
-                ));
-            })?
-        };
+        let db_handle = unsafe { &*handle };
 
-        let db = open_wallet_db(db_path, network)?;
-
-        let height = db.get_wallet_summary(ConfirmationsPolicy::default()).map_err(|e| {
+        let height = db_handle.db.get_wallet_summary(ConfirmationsPolicy::default()).map_err(|e| {
             ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
                 "Failed to get wallet summary: {}",
                 e
@@ -1130,7 +1227,7 @@ pub unsafe extern "C" fn lrzhs_fully_scanned_height(
             Some(s) => Ok(i64::from(u32::from(s.fully_scanned_height()))),
             None => Ok(-1i64),
         }
-    });
+    }));
 
     match res {
         Ok(inner) => unwrap_exc_or(inner, -1i64),
@@ -1143,26 +1240,19 @@ pub unsafe extern "C" fn lrzhs_fully_scanned_height(
 
 #[no_mangle]
 pub unsafe extern "C" fn lrzhs_suggest_scan_ranges(
-    db_data: *const u8,
-    db_data_len: usize,
-    network_id: u32,
+    handle: *mut ffi::DbHandle,
 ) -> *mut FfiScanRanges {
-    let res = std::panic::catch_unwind(|| {
-        let network = parse_network(network_id)?;
+    let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+                "Wallet handle is null"
+            ));
+            return Err(());
+        }
 
-        let db_path = unsafe {
-            let slice = std::slice::from_raw_parts(db_data, db_data_len);
-            std::str::from_utf8(slice).map_err(|e| {
-                ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
-                    "Invalid UTF-8 in database path: {}",
-                    e
-                ));
-            })?
-        };
+        let db_handle = unsafe { &*handle };
 
-        let db = open_wallet_db(db_path, network)?;
-
-        let ranges = db.suggest_scan_ranges().map_err(|e| {
+        let ranges = db_handle.db.suggest_scan_ranges().map_err(|e| {
             ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
                 "Failed to get scan ranges: {}",
                 e
@@ -1197,7 +1287,7 @@ pub unsafe extern "C" fn lrzhs_suggest_scan_ranges(
         };
 
         Ok(Box::into_raw(Box::new(FfiScanRanges { ranges: ptr, len })))
-    });
+    }));
 
     match res {
         Ok(inner) => unwrap_exc_or(inner, std::ptr::null_mut()),
@@ -1229,6 +1319,25 @@ pub extern "C" fn lrzhs_branch_id_for_height(height: u32, network_id: u32) -> u3
         }
     }
 }
+
+// ============================================================================
+// Block Cache Operations
+// ============================================================================
+// NOTE: These functions require the "unstable" feature on zcash_client_sqlite
+// and need further work to properly match the Haskell FFI signatures.
+// TODO: Implement when discussing block scanning.
+
+// ============================================================================
+// Subtree Root Operations
+// ============================================================================
+// NOTE: These require proper CommitmentTreeRoot usage from zcash_client_backend.
+// TODO: Implement when discussing block scanning.
+
+// ============================================================================
+// Transaction Proposals
+// ============================================================================
+// NOTE: These require careful API matching with zcash_client_backend.
+// TODO: Implement when discussing transaction creation.
 
 #[cfg(test)]
 mod tests {
