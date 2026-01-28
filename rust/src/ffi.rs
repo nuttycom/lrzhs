@@ -6,7 +6,26 @@
 use std::ffi::c_char;
 use std::ptr;
 
-use zcash_client_sqlite::AccountUuid;
+use rand::rngs::OsRng;
+use zcash_client_sqlite::util::SystemClock;
+use zcash_client_sqlite::{AccountUuid, WalletDb};
+
+use crate::Network;
+
+/// Opaque handle to an open wallet database connection.
+///
+/// This handle wraps a `WalletDb` instance and allows the Haskell side to
+/// maintain a persistent database connection across multiple FFI calls,
+/// avoiding the overhead of opening/closing the database on each operation.
+///
+/// # Thread Safety
+///
+/// This handle should be used from a single thread at a time. The underlying
+/// SQLite connection has limitations on concurrent writes.
+pub struct DbHandle {
+    pub db: WalletDb<rusqlite::Connection, Network, SystemClock, OsRng>,
+    pub network: Network,
+}
 
 /// A UUID represented as 16 bytes for FFI.
 #[repr(C)]
@@ -505,6 +524,22 @@ pub unsafe extern "C" fn lrzhs_string_free(s: *mut c_char) {
     if !s.is_null() {
         unsafe {
             let _ = std::ffi::CString::from_raw(s);
+        }
+    }
+}
+
+/// Close a wallet database handle and free its resources.
+///
+/// After calling this function, the handle is no longer valid and must not
+/// be used. Passing a null pointer is safe and will be ignored.
+///
+/// # Safety
+/// The pointer must have been allocated by `lrzhs_open_wallet`.
+#[no_mangle]
+pub unsafe extern "C" fn lrzhs_close_wallet(handle: *mut DbHandle) {
+    if !handle.is_null() {
+        unsafe {
+            let _ = Box::from_raw(handle);
         }
     }
 }

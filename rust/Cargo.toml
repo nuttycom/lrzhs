@@ -22,14 +22,21 @@ wagyu-zcash-parameters = "0.2"
 
 # Zcash dependencies - versions must match what zcash_client_backend uses
 zcash_client_backend = { version = "0.21", features = ["orchard"] }
-zcash_client_sqlite = { version = "0.19", features = ["orchard"] }
+zcash_client_sqlite = { version = "0.19", features = ["orchard", "unstable"] }
 zcash_keys = { version = "0.12", features = ["unstable", "orchard", "sapling"] }
 zcash_primitives = "0.26"
 zcash_protocol = "0.7"
+zcash_proofs = { version = "0.26", features = ["bundled-prover"] }
+prost = "0.13"
 zcash_address = "0.10"
 zip32 = "0.2"
 secrecy = "0.8"
 rusqlite = "0.37"
+
+# Tree/frontier parsing - versions must match zcash_client_backend
+incrementalmerkletree = "0.8"
+sapling = { package = "sapling-crypto", version = "0.5", default-features = false }
+orchard = { version = "0.11", default-features = false }
 
 [build-dependencies]
 cbindgen = "0.27"
