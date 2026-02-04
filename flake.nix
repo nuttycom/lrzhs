@@ -26,7 +26,6 @@
         src = craneLib.cleanCargoSource ./rust/.;
 
         buildInputs = pkgs.lib.optionals pkgs.stdenv.isDarwin [
-          pkgs.darwin.apple_sdk.frameworks.Security
           pkgs.libiconv
         ];
 
