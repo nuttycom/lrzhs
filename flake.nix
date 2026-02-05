@@ -4,10 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/release-25.11";
     flake-utils.url = "github:numtide/flake-utils";
-    crane = {
-      inputs.nixpkgs.follows = "nixpkgs";
-      url = github:ipetkov/crane;
-    };
+    crane.url = "github:ipetkov/crane";
   };
 
   outputs = {
@@ -26,7 +23,6 @@
         src = craneLib.cleanCargoSource ./rust/.;
 
         buildInputs = pkgs.lib.optionals pkgs.stdenv.isDarwin [
-          pkgs.darwin.apple_sdk.frameworks.Security
           pkgs.libiconv
         ];
 
