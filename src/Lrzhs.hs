@@ -10,10 +10,9 @@ where
 import qualified Data.ByteString.Unsafe as BSU
 import Data.Text (Text, pack, unpack)
 import Foreign.C (CBool (..))
-import Foreign.C.String (peekCString, peekCStringLen, withCString)
-import Foreign.C.Types (CChar)
+import Foreign.C.String (peekCString, withCString)
 import Foreign.Marshal.Alloc (allocaBytes)
-import Foreign.Ptr (Ptr, castPtr, nullPtr)
+import Foreign.Ptr (castPtr, nullPtr)
 import Lrzhs.Ffi
   ( networkId,
     rs_derive_orchard_address,
@@ -39,7 +38,7 @@ getLastError = do
       written <- rs_error_message_utf8 buf len
       if written <= 0
         then pure (pack "unknown error")
-        else pack <$> peekCStringLen (buf, fromIntegral written)
+        else pack <$> peekCString buf
 
 -- | Derive a fresh Orchard-only Unified Address from a ZIP-316 Unified Incoming
 -- Viewing Key at the given diversifier index. Returns 'Left' if the UIVK is

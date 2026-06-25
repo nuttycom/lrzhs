@@ -4,6 +4,7 @@ import qualified Data.ByteString as BS
 import Data.Either (isLeft)
 import Data.Maybe (fromJust)
 import Data.Text (Text)
+import qualified Data.Text as T
 import Lrzhs (deriveOrchardAddress, isValidShieldedAddress, mkDiversifierIndex)
 import Lrzhs.Types (Network (..))
 import System.Exit (exitFailure, exitSuccess)
@@ -54,7 +55,11 @@ main = do
         test
           "derive rejects a network mismatch"
           True
-          (isLeft <$> deriveOrchardAddress Testnet testUivk zeroIdx)
+          (isLeft <$> deriveOrchardAddress Testnet testUivk zeroIdx),
+        test
+          "derive error message is NUL-free"
+          True
+          (either (T.all (/= '\NUL')) (const False) <$> deriveOrchardAddress Mainnet "not-a-uivk" zeroIdx)
       ]
   if and results then exitSuccess else exitFailure
 
