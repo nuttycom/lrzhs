@@ -4,7 +4,7 @@
 //! - `lrzhs_is_valid_shielded_address`: Validates shielded addresses (Sapling or
 //!   Unified addresses containing shielded receivers)
 
-use std::ffi::{c_char, CStr};
+use std::ffi::{c_char, CStr, CString};
 
 use zcash_address::unified::Container;
 use zcash_address::{ConversionError, TryFromAddress, ZcashAddress};
@@ -144,6 +144,135 @@ pub unsafe extern "C" fn lrzhs_is_valid_shielded_address(
     }
 }
 
+/// Derive a fresh Orchard-only Unified Address from a ZIP-316 Unified Incoming
+/// Viewing Key at the given 88-bit diversifier index.
+///
+/// `uivk` is a NUL-terminated `uivk1…` string. `diversifier_index` points to
+/// exactly 11 bytes. `network_id`: 0 = Testnet, 1 = Mainnet; it must match the
+/// network encoded in the UIVK.
+///
+/// Returns a newly allocated `u1…` C string (free with `lrzhs_string_free`), or
+/// NULL on error (details via `lrzhs_last_error_*`).
+///
+/// # Safety
+/// `uivk` must be a valid NUL-terminated string; `diversifier_index` must point
+/// to at least 11 readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn lrzhs_derive_orchard_address(
+    uivk: *const c_char,
+    diversifier_index: *const u8,
+    network_id: u32,
+) -> *mut c_char {
+    use orchard::keys::IncomingViewingKey as OrchardIvk;
+    use zcash_address::unified::{
+        Address as UnifiedAddress, Container, Encoding, Ivk, Receiver, Uivk,
+    };
+
+    let res = std::panic::catch_unwind(|| {
+        if uivk.is_null() || diversifier_index.is_null() {
+            ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+                "null pointer argument"
+            ));
+            return Err(());
+        }
+        let expected_network = parse_network(network_id)?;
+
+        let uivk_str = match unsafe { CStr::from_ptr(uivk) }.to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+                    "Invalid UTF-8 in UIVK: {}",
+                    e
+                ));
+                return Err(());
+            }
+        };
+
+        // Reading exactly 11 bytes makes the try_into total; the arm is defensive.
+        let index_bytes: [u8; 11] =
+            unsafe { std::slice::from_raw_parts(diversifier_index, 11) }
+                .try_into()
+                .map_err(|_| {
+                    ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+                        "Invalid diversifier index (expected 11 bytes)"
+                    ));
+                })?;
+
+        let (net, parsed) = Uivk::decode(uivk_str).map_err(|e| {
+            ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+                "Failed to decode UIVK: {}",
+                e
+            ));
+        })?;
+
+        if net != expected_network {
+            ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+                "UIVK network does not match requested network"
+            ));
+            return Err(());
+        }
+
+        let orchard_ivk_bytes: [u8; 64] = parsed
+            .items()
+            .into_iter()
+            .find_map(|item| match item {
+                Ivk::Orchard(data) => Some(data),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+                    "UIVK has no Orchard receiver"
+                ));
+            })?;
+
+        let ivk = OrchardIvk::from_bytes(&orchard_ivk_bytes)
+            .into_option()
+            .ok_or_else(|| {
+                ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+                    "Invalid Orchard incoming viewing key bytes"
+                ));
+            })?;
+
+        let receiver = ivk.address_at(index_bytes).to_raw_address_bytes();
+
+        let ua = UnifiedAddress::try_from_items(vec![Receiver::Orchard(receiver)])
+            .map_err(|e| {
+                ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+                    "Failed to build unified address: {}",
+                    e
+                ));
+            })?
+            .encode(&net);
+
+        let cstr = CString::new(ua).map_err(|e| {
+            ffi_helpers::error_handling::update_last_error(anyhow::anyhow!(
+                "Invalid address string: {}",
+                e
+            ));
+        })?;
+        Ok(cstr.into_raw())
+    });
+
+    match res {
+        Ok(inner) => unwrap_exc_or(inner, std::ptr::null_mut()),
+        Err(_) => {
+            ffi_helpers::error_handling::update_last_error(anyhow::anyhow!("Panic occurred"));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Free a string previously returned by an lrzhs function.
+///
+/// # Safety
+/// `s` must be a pointer returned by this library, or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn lrzhs_string_free(s: *mut c_char) {
+    if !s.is_null() {
+        drop(unsafe { CString::from_raw(s) });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +343,72 @@ mod tests {
     #[test]
     fn test_empty_address_returns_false() {
         assert!(!is_valid_shielded_address("", NetworkType::Main));
+    }
+}
+
+#[cfg(test)]
+mod derive_tests {
+    use super::*;
+    use orchard::keys::{FullViewingKey, SpendingKey};
+    use std::ffi::{CStr, CString};
+    use zcash_address::unified::{Address, Encoding, Ivk, Receiver, Uivk};
+    use zcash_protocol::consensus::NetworkType;
+    use zip32::Scope;
+
+    fn mainnet_uivk(seed: u8) -> (String, orchard::keys::IncomingViewingKey) {
+        let sk = SpendingKey::from_bytes([seed; 32]).unwrap();
+        let ivk = FullViewingKey::from(&sk).to_ivk(Scope::External);
+        let uivk = Uivk::try_from_items(vec![Ivk::Orchard(ivk.to_bytes())])
+            .unwrap()
+            .encode(&NetworkType::Main);
+        (uivk, ivk)
+    }
+
+    fn call(uivk: &str, index: [u8; 11], network_id: u32) -> Option<String> {
+        let c = CString::new(uivk).unwrap();
+        let ptr = unsafe { lrzhs_derive_orchard_address(c.as_ptr(), index.as_ptr(), network_id) };
+        if ptr.is_null() {
+            None
+        } else {
+            let s = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap().to_owned();
+            unsafe { lrzhs_string_free(ptr) };
+            Some(s)
+        }
+    }
+
+    #[test]
+    fn derives_expected_orchard_only_address() {
+        let (uivk, ivk) = mainnet_uivk(7);
+        let index = [0u8; 11];
+        let expected = Address::try_from_items(vec![Receiver::Orchard(
+            ivk.address_at(index).to_raw_address_bytes(),
+        )])
+        .unwrap()
+        .encode(&NetworkType::Main);
+        assert_eq!(call(&uivk, index, 1), Some(expected));
+    }
+
+    #[test]
+    fn distinct_indices_give_distinct_addresses() {
+        let (uivk, _) = mainnet_uivk(7);
+        assert!(call(&uivk, [0u8; 11], 1) != call(&uivk, [9u8; 11], 1));
+    }
+
+    #[test]
+    fn rejects_invalid_uivk() {
+        assert_eq!(call("not-a-uivk", [0u8; 11], 1), None);
+    }
+
+    #[test]
+    fn rejects_network_mismatch() {
+        let (uivk, _) = mainnet_uivk(7);
+        assert_eq!(call(&uivk, [0u8; 11], 0), None);
+    }
+
+    #[test]
+    fn rejects_null_uivk() {
+        let index = [0u8; 11];
+        let ptr = unsafe { lrzhs_derive_orchard_address(std::ptr::null(), index.as_ptr(), 1) };
+        assert!(ptr.is_null());
     }
 }
